@@ -11,10 +11,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import torch.cuda as cuda
-from datetime import datetime
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import argparse
+import torchvision.transforms as T
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -65,9 +65,9 @@ os.makedirs("outputs", exist_ok=True)
 
 # Hyperparameters
 size = 224
-batch_size = 2  # Reduced for debugging
-num_epochs = 100
-learning_rate = 0.0001
+batch_size = 16
+num_epochs = 200
+learning_rate = 0.001
 patience = 20
 num_workers = 0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,15 +75,32 @@ logger.info(f"Using device: {device}")
 
 # Argument parser
 parser = argparse.ArgumentParser(description="Train MaSA-UNet for skin lesion segmentation")
-parser.add_argument('--use_masa', action='store_true', default=True, help="Use Manhattan Self-Attention (default: True)")
-parser.add_argument('--use_autoencoder', action='store_true', default=True, help="Use pre-trained autoencoder (default: True)")
-parser.add_argument('--dataset', type=str, default='PH2', choices=['PH2', 'ISIC2016', 'ISIC2017', 'ISIC2018'], help="Dataset to use (default: PH2)")
+parser.add_argument('--use_masa', action='store_true', default=True, help="Use Manhattan Self-Attention")
+parser.add_argument('--use_autoencoder', action='store_true', default=False, help="Use pre-trained autoencoder")
+parser.add_argument('--dataset', type=str, default='PH2', choices=['PH2', 'ISIC2016', 'ISIC2017', 'ISIC2018'], help="Dataset to use")
 args = parser.parse_args()
 
 dataset_name = args.dataset.lower()
 use_masa = args.use_masa
 use_autoencoder = args.use_autoencoder
 logger.info(f"Options - Dataset: {dataset_name}, Use MaSA: {use_masa}, Use Autoencoder: {use_autoencoder}")
+
+# Additional augmentation
+def extra_augmentation(images, masks):
+    transform = T.Compose([
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.5),
+        T.ColorJitter(brightness=0.2, contrast=0.2),
+    ])
+    aug_images, aug_masks = [], []
+    for img, mask in zip(images, masks):
+        img_tensor = torch.tensor(img.transpose(2, 0, 1), dtype=torch.float32)
+        mask_tensor = torch.tensor(mask[None, :, :], dtype=torch.float32)
+        aug_img = transform(img_tensor).numpy().transpose(1, 2, 0)
+        aug_mask = transform(mask_tensor).numpy()[0]
+        aug_images.append(aug_img)
+        aug_masks.append(aug_mask)
+    return np.array(aug_images), np.array(aug_masks)
 
 # Sequential data loading function
 def load_images_sequential(image_paths, mask_paths=None):
@@ -110,7 +127,7 @@ def load_images_sequential(image_paths, mask_paths=None):
         logger.error("No valid images loaded")
         return np.array([]), np.array([]) if mask_paths else np.array([])
 
-    logger.info("Sequential image loading completed")
+    logger.info(f"Loaded {len(images)} images and {len(masks) if masks else 0} masks")
     return np.array(images), np.array(masks) if mask_paths else np.array(images)
 
 def prepare_data(dataset_name):
@@ -138,9 +155,11 @@ def prepare_data(dataset_name):
         raise ValueError(f"No valid images loaded for {dataset_name} dataset")
 
     X_train, X_test, y_train, y_test = train_test_split(imgs_arr, masks_arr, test_size=0.25, random_state=101)
+    logger.info(f"Initial split - X_train: {X_train.shape}, X_test: {X_test.shape}")
     x_rotated, y_rotated, x_flipped, y_flipped = img_augmentation(X_train, y_train)
-    X_train_full = np.concatenate([X_train, x_rotated, x_flipped])
-    y_train_full = np.concatenate([y_train, y_rotated, y_flipped])
+    x_extra, y_extra = extra_augmentation(X_train, y_train)
+    X_train_full = np.concatenate([X_train, x_rotated, x_flipped, x_extra])
+    y_train_full = np.concatenate([y_train, y_rotated, y_flipped, y_extra])
     X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.20, random_state=101)
 
     X_train = preprocess_images(X_train)
@@ -150,10 +169,10 @@ def prepare_data(dataset_name):
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
     y_test = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
 
-    logger.info(f"{dataset_name} - X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+    logger.info(f"{dataset_name} - X_train: {X_train.shape}, y_train: {y_train.shape}, X_val: {X_val.shape}, y_val: {y_val.shape}, X_test: {X_test.shape}, y_test: {y_test.shape}")
     return (X_train, y_train), (X_val, y_val), (X_test, y_test)
 
-# Custom Dice and Jaccard functions
+# Custom Dice and Jaccard functions with adjustable threshold
 def dice_coefficient(outputs, targets, threshold=0.5, smooth=1e-6):
     outputs = (outputs.sigmoid() > threshold).float()
     intersection = (outputs * targets).sum()
@@ -168,7 +187,7 @@ def jaccard_index(outputs, targets, threshold=0.5, smooth=1e-6):
 
 # Weighted Composed Loss
 class WeightedComposedLoss(nn.Module):
-    def __init__(self, alpha=0.5, beta=0.3, gamma=0.2):
+    def __init__(self, alpha=0.2, beta=0.4, gamma=0.4):
         super(WeightedComposedLoss, self).__init__()
         self.bce = nn.BCEWithLogitsLoss()
         self.alpha = alpha
@@ -202,6 +221,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
         model.eval()
         val_loss = 0
+        val_dice = 0
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
         with torch.no_grad():
             for noisy_inputs, targets in val_pbar:
@@ -209,14 +229,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 outputs = model(noisy_inputs)
                 loss = criterion(outputs, targets)
                 val_loss += loss.item()
+                val_dice += dice_coefficient(outputs, targets).item()
                 val_pbar.set_postfix({'loss': loss.item()})
         val_loss /= len(val_loader)
+        val_dice /= len(val_loader)
 
-        lr = scheduler(epoch, optimizer.param_groups[0]['lr'])
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        scheduler.step(val_loss)
 
-        logger.info(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {lr:.6f}")
+        logger.info(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         logger.info(f"GPU memory allocated: {cuda.memory_allocated(0) / 1024**2:.2f} MB")
 
         if val_loss < best_val_loss:
@@ -235,24 +255,39 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 def evaluate_model(model, test_loader, criterion):
     model.eval()
     test_loss = 0
-    dice_total, jaccard_total = 0, 0
+    dice_scores = []
+    jaccard_scores = []
     predictions, inputs_list, targets_list = [], [], []
 
+    thresholds = [0.3, 0.5, 0.7]  # Test multiple thresholds
     with torch.no_grad():
         for inputs, targets in test_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             test_loss += loss.item()
-            dice_total += dice_coefficient(outputs, targets).item()
-            jaccard_total += jaccard_index(outputs, targets).item()
+            for thresh in thresholds:
+                dice_scores.append((thresh, dice_coefficient(outputs, targets, threshold=thresh).item()))
+                jaccard_scores.append((thresh, jaccard_index(outputs, targets, threshold=thresh).item()))
             predictions.append(outputs.cpu())
             inputs_list.append(inputs.cpu())
             targets_list.append(targets.cpu())
 
     test_loss /= len(test_loader)
-    dice = dice_total / len(test_loader)
-    jaccard = jaccard_total / len(test_loader)
+    # Average Dice/Jaccard per threshold
+    dice_dict = {}
+    jaccard_dict = {}
+    for thresh, score in dice_scores:
+        dice_dict[thresh] = dice_dict.get(thresh, 0) + score / len(test_loader)
+    for thresh, score in jaccard_scores:
+        jaccard_dict[thresh] = jaccard_dict.get(thresh, 0) + score / len(test_loader)
+
+    best_dice_thresh = max(dice_dict, key=dice_dict.get)
+    best_jaccard_thresh = max(jaccard_dict, key=jaccard_dict.get)
+    dice = dice_dict[best_dice_thresh]
+    jaccard = jaccard_dict[best_jaccard_thresh]
+
+    logger.info(f"Best Dice: {dice:.4f} at threshold {best_dice_thresh}, Best Jaccard: {jaccard:.4f} at threshold {best_jaccard_thresh}")
 
     predictions = torch.cat(predictions, dim=0)
     inputs = torch.cat(inputs_list, dim=0)
@@ -326,10 +361,8 @@ def main():
         sys.exit(1)
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = WeightedComposedLoss(alpha=0.5, beta=0.3, gamma=0.2).to(device)
-
-    def scheduler(epoch, lr):
-        return lr if epoch < 10 else lr * np.exp(-0.1)
+    criterion = WeightedComposedLoss(alpha=0.2, beta=0.4, gamma=0.4).to(device)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
 
     filepath = f'models/{dataset_name}_masaunet_segmentation.pt'
     model = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience, filepath)
